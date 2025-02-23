@@ -526,7 +526,7 @@ class YogaApp(QMainWindow):
         self.phase = "warmup"
         self.phase_start_time = time.time()
         self.live_feed.info_panel.begin_button.setVisible(False)
-        self.tts_manager.speak("Welcome to Alineify. Get ready for your warm-up.")
+        self.tts_manager.speak("Welcome to A line if i. Get ready for your warm-up.")
 
     def create_welcome_overlay(self, overlay):
         """Create a professional welcome screen overlay with centered text and button"""
@@ -822,7 +822,7 @@ class YogaApp(QMainWindow):
                     self.current_pose_index += 1
                     if self.current_pose_index >= len(self.calibration_poses):
                         self.phase = "completed"
-                        self.tts_manager.speak("Congratulations! You've completed the Alineify Yoga routine!")
+                        self.tts_manager.speak("Congratulations! You've completed the A line if i Yoga routine!")
                     else:
                         next_pose = self.calibration_poses[self.current_pose_index]["name"]
                         self.tts_manager.speak(f"Next pose: {next_pose}")
