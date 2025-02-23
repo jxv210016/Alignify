@@ -708,20 +708,11 @@ class YogaApp(QMainWindow):
             
             elif self.phase == "calibration_delay":
                 remaining = int(self.calibration_post_delay - (current_time - self.phase_start_time))
-                current_pose = self.calibration_poses[self.current_calibration_index]
-                self.live_feed.info_panel.update_info(
-                    title=f"{current_pose['name']} Calibrated",
-                    timer="",
-                    instruction="Preparing for next pose...",
-                    image_path=current_pose["file"]
-                )
-                overlay = self.create_countdown_overlay(overlay, remaining)
                 self.status_label.setText("Status: Preparing next calibration pose")
                 if remaining <= 0:
                     self.current_calibration_index += 1
                     if self.current_calibration_index < len(self.calibration_poses):
-                        next_pose = self.calibration_poses[self.current_calibration_index]["name"]
-                        self.tts_manager.speak(f"Get ready for {next_pose}.")
+                        self.tts_manager.speak(f"Get ready for {self.calibration_poses[self.current_calibration_index]['name']}.")
                         self.phase = "calibration"
                         self.phase_start_time = current_time
                     else:
@@ -730,8 +721,12 @@ class YogaApp(QMainWindow):
                         self.status_label.setText("Status: Calibration complete")
                         self.start_button.setEnabled(True)
                         self.recalibrate_button.setEnabled(True)
+                        # Explicitly show these buttons if they were hidden:
+                        self.start_button.setVisible(True)
+                        self.recalibrate_button.setVisible(True)
                         self.tts_manager.speak("Calibration complete. Press Start Session when you're ready.")
                         self.phase = "calibration_complete"
+
             
             elif self.phase == "calibration_complete":
                 # Just show the final calibration image without countdown
