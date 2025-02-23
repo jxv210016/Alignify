@@ -186,3 +186,11 @@ sentencepiece==0.2.0
 six==1.17.0
 sounddevice==0.5.1
 zipp==3.21.0
+Flask
+flask-cors
+opencv-python
+mediapipe
+pyttsx3
+numpy
+Pillow
+
