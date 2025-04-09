@@ -1,135 +1,174 @@
+import asyncio
+import websockets
+import json
+import logging
+import random
+import time
 import cv2
 import mediapipe as mp
-import json
 import numpy as np
-import requests
-import tempfile
-import os
-from playsound import playsound
-import time
 import threading
-import queue
-from dotenv import load_dotenv
-import pyttsx3
-import base64
-import io
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from PIL import Image
+from collections import deque
+import os
 
-app = Flask(__name__)
-CORS(app)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-@app.route('/')
-def index():
-    return "Flask server is running!"
-
-# -------------------------------
-# ElevenLabs API configuration
-# -------------------------------
-load_dotenv()
-ELEVENLABS_API_KEY = os.environ.get("ELEVEN_LABS_KEY")
-ELEVENLABS_VOICE_ID = "fCgaP7ly9dCduQaZ4pck"  # Replace with your chosen voice ID
-
-def speak(text):
-    """
-    Uses ElevenLabs TTS to speak out the provided text.
-    """
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
-    headers = {
-        "Accept": "audio/mpeg",
-        "Content-Type": "application/json",
-        "xi-api-key": ELEVENLABS_API_KEY
-    }
-    data = {
-        "text": text,
-        "voice_settings": {
-            "stability": 0.75,
-            "similarity_boost": 0.75
-        }
-    }
-    response = requests.post(url, headers=headers, json=data)
-    if response.status_code == 200:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
-            tmp_file.write(response.content)
-            tmp_filename = tmp_file.name
-        playsound(tmp_filename)
-        os.remove(tmp_filename)
-    else:
-        print("Error with ElevenLabs TTS:", response.text)
-
-# -------------------------------
-# Load reference pose landmarks
-# -------------------------------
-with open('landmarks.json', 'r') as f:
-    ref_data = json.load(f)
-
-# Define the sequence of poses
-pose_sequence = ['warrior.jpg', 'warrrior_II_left.jpg', 'warrrior_II_right.jpg', 'tree.jpg']
-
-# Global state variables
-current_pose_index = 0
-hold_duration = 5           # seconds to hold each pose
-pose_transition_delay = 5   # seconds between poses
-
-# -------------------------------
-# Initialize MediaPipe Pose
-# -------------------------------
+# MediaPipe pose setup
 mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.5)
-mp_drawing = mp.solutions.drawing_utils
+pose_detector = mp_pose.Pose(
+    static_image_mode=False,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
 
-# Set custom drawing specifications (unused in API mode)
-landmark_drawing_spec = mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=4, circle_radius=6)
-connection_drawing_spec = mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=4, circle_radius=2)
+# Store client connections
+clients = set()
 
-# -------------------------------
-# Thresholds for movement
-# -------------------------------
-x_threshold = 0.12
-y_threshold = 0.12
+# Calibration data storage - this will store calibration state for each pose
+calibration_data = {}
 
-# Simplified body parts mapping
+# Session state for clients
+client_sessions = {}
+
+# Global variables for video processing
+frame_buffer = deque(maxlen=5)  # Store recent frames
+current_landmarks = {}  # Store current landmarks
+processing_active = True
+video_capture = None
+
+# Feedback thresholds
+x_threshold = 0.1
+y_threshold = 0.1
+
+# Body parts mapping for feedback
 body_parts = {
     'ARM': {
-        'LEFT': ['LEFT_WRIST', 'LEFT_ELBOW', 'LEFT_SHOULDER'],
-        'RIGHT': ['RIGHT_WRIST', 'RIGHT_ELBOW', 'RIGHT_SHOULDER']
+        'RIGHT': ['LEFT_WRIST', 'LEFT_ELBOW', 'LEFT_SHOULDER'],
+        'LEFT': ['RIGHT_WRIST', 'RIGHT_ELBOW', 'RIGHT_SHOULDER']
     },
     'LEG': {
-        'LEFT': ['LEFT_ANKLE', 'LEFT_KNEE', 'LEFT_HIP'],
-        'RIGHT': ['RIGHT_ANKLE', 'RIGHT_KNEE', 'RIGHT_HIP']
+        'RIGHT': ['LEFT_ANKLE', 'LEFT_KNEE', 'LEFT_HIP'],
+        'LEFT': ['RIGHT_ANKLE', 'RIGHT_KNEE', 'RIGHT_HIP']
     }
 }
 
+# Initialize video capture in a background thread
+def initialize_video_capture():
+    global video_capture
+    try:
+        video_capture = cv2.VideoCapture(0)
+        if not video_capture.isOpened():
+            logger.error("Error: Could not open video capture device")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Error initializing video capture: {str(e)}")
+        return False
+
+# Process video frames in a background thread
+def process_video_frames():
+    global current_landmarks, processing_active, video_capture
+    
+    logger.info("Starting video processing thread")
+    
+    while processing_active:
+        if video_capture is None or not video_capture.isOpened():
+            logger.warning("Video capture not available, attempting to initialize...")
+            if not initialize_video_capture():
+                logger.error("Failed to initialize video capture, retrying in 3 seconds...")
+                time.sleep(3)
+                continue
+        
+        try:
+            # Read a frame from the camera
+            success, frame = video_capture.read()
+            if not success:
+                logger.warning("Failed to read frame, retrying...")
+                time.sleep(0.1)
+                continue
+            
+            # No longer flipping the frame - displaying the raw camera output
+            # frame = cv2.flip(frame, 1)
+            
+            # Add the frame to our buffer
+            frame_buffer.append(frame)
+            
+            # Convert the frame to RGB for MediaPipe
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Process the frame with MediaPipe Pose
+            results = pose_detector.process(frame_rgb)
+            
+            # Extract landmarks if detected
+            if results.pose_landmarks:
+                # Convert landmarks to dictionary format for WebSocket transmission
+                landmarks_dict = {}
+                for i, landmark in enumerate(results.pose_landmarks.landmark):
+                    landmarks_dict[i] = {
+                        "x": landmark.x,
+                        "y": landmark.y,
+                        "z": landmark.z
+                    }
+                
+                # Update the global landmarks
+                current_landmarks = landmarks_dict
+            else:
+                # If no landmarks detected, keep the last detected landmarks for a smoother experience
+                pass
+                
+            # Add short delay to prevent CPU overuse
+            time.sleep(0.03)  # ~30 fps
+            
+        except Exception as e:
+            logger.error(f"Error in video processing: {str(e)}")
+            time.sleep(0.1)
+    
+    # Clean up resources when stopping
+    if video_capture is not None:
+        video_capture.release()
+    logger.info("Video processing thread stopped")
+
+# Compare user landmarks with reference pose and generate feedback
 def get_direction_feedback(user_landmarks, ref_landmarks):
-    """
-    Compare arms and legs positions between user's pose and reference.
-    Returns the most important feedback message.
-    """
+    """Compare user's pose with reference pose and return feedback."""
     all_feedback = []
     
-    # Check each limb (arms and legs)
+    # Convert numeric indices to MediaPipe pose landmark names
+    named_user_landmarks = {}
+    named_ref_landmarks = {}
+    
+    for index, values in user_landmarks.items():
+        if hasattr(mp_pose.PoseLandmark, str(index)):
+            name = mp_pose.PoseLandmark(int(index)).name
+            named_user_landmarks[name] = (values["x"], values["y"], values["z"])
+    
+    for index, values in ref_landmarks.items():
+        if hasattr(mp_pose.PoseLandmark, str(index)):
+            name = mp_pose.PoseLandmark(int(index)).name
+            named_ref_landmarks[name] = (values["x"], values["y"], values["z"])
+    
+    # Compare body parts
     for limb_type, sides in body_parts.items():
         for side, landmarks in sides.items():
-            if all(lm in user_landmarks for lm in landmarks) and all(lm in ref_landmarks for lm in landmarks):
-                user_x = np.mean([user_landmarks[lm][0] for lm in landmarks])
-                user_y = np.mean([user_landmarks[lm][1] for lm in landmarks])
-                ref_x = np.mean([ref_landmarks[lm][0] for lm in landmarks])
-                ref_y = np.mean([ref_landmarks[lm][1] for lm in landmarks])
+            if all(lm in named_user_landmarks for lm in landmarks) and all(lm in named_ref_landmarks for lm in landmarks):
+                user_x = np.mean([named_user_landmarks[lm][0] for lm in landmarks])
+                user_y = np.mean([named_user_landmarks[lm][1] for lm in landmarks])
+                ref_x = np.mean([named_ref_landmarks[lm][0] for lm in landmarks])
+                ref_y = np.mean([named_ref_landmarks[lm][1] for lm in landmarks])
                 
                 diff_x = user_x - ref_x
                 diff_y = user_y - ref_y
                 
                 description = f"{side.lower()} {limb_type.lower()}"
-                
                 if abs(diff_x) > x_threshold:
-                    direction = "left" if diff_x > 0 else "right"
+                    direction = "left" if diff_x < 0 else "right"
                     all_feedback.append({
                         'part': description,
                         'message': f"Move your {description} {direction}",
                         'diff': abs(diff_x)
                     })
-                
                 if abs(diff_y) > y_threshold:
                     direction = "up" if diff_y > 0 else "down"
                     all_feedback.append({
@@ -140,60 +179,232 @@ def get_direction_feedback(user_landmarks, ref_landmarks):
     
     if all_feedback:
         all_feedback.sort(key=lambda x: x['diff'], reverse=True)
-        return [all_feedback[0]['message']]
-    return []
+        return all_feedback[0]['message']
+    return "Good alignment! Hold the pose"
 
-# -------------------------------
-# API Endpoint to Process a Single Frame
-# -------------------------------
-@app.route('/process_frame', methods=['POST'])
-def process_frame_endpoint():
-    """
-    Expects a JSON payload with key "image" containing a base64‑encoded image.
-    Returns a JSON response with feedback text.
-    """
-    data = request.get_json()
-    if 'image' not in data:
-        return jsonify({'error': 'No image provided'}), 400
-
-    image_data = data['image']
-    # Remove header (if present) from base64 string.
-    if ',' in image_data:
-        _, encoded = image_data.split(',', 1)
-    else:
-        encoded = image_data
-
-    try:
-        image_bytes = base64.b64decode(encoded)
-    except Exception:
-        return jsonify({'error': 'Invalid image encoding'}), 400
-
-    try:
-        image = Image.open(io.BytesIO(image_bytes))
-        frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    except Exception:
-        return jsonify({'error': 'Failed to process image'}), 500
-
-    # Process the frame with MediaPipe.
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = pose.process(frame_rgb)
-    response = {}
-    if results.pose_landmarks:
-        user_landmarks = {
-            mp_pose.PoseLandmark(i).name: (lm.x, lm.y, lm.z)
-            for i, lm in enumerate(results.pose_landmarks.landmark)
-        }
-        current_pose = pose_sequence[current_pose_index]
-        ref_landmarks = ref_data[current_pose]
-        feedback_messages = get_direction_feedback(user_landmarks, ref_landmarks)
-        if feedback_messages:
-            response['display'] = feedback_messages[0]
-        else:
-            response['display'] = "Perfect! Hold this pose."
-    else:
-        response['display'] = "No pose detected"
+# WebSocket handler
+async def ws_handler(websocket, path):
+    # Add the client to our set and create session state
+    client_id = id(websocket)
+    clients.add(websocket)
+    client_sessions[client_id] = {
+        "active_pose": None,
+        "calibrated_poses": set(),
+        "session_active": False,
+        "last_feedback_time": time.time()
+    }
     
-    return jsonify(response)
+    logger.info(f"New client connected. ID: {client_id}. Total clients: {len(clients)}")
+    
+    try:
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+                action = data.get('action')
+                
+                logger.info(f"Received action: {action} from client {client_id}")
+                
+                if action == 'calibrate':
+                    # Store calibration data for a pose
+                    pose_name = data.get('pose')
+                    logger.info(f"Calibrating pose: {pose_name} for client {client_id}")
+                    
+                    # Use current landmarks for calibration
+                    if current_landmarks:
+                        calibration_data[pose_name] = current_landmarks
+                        
+                        # Mark this pose as calibrated for this client
+                        client_sessions[client_id]["calibrated_poses"].add(pose_name)
+                        
+                        # Send confirmation with current landmarks
+                        await asyncio.sleep(0.5)  # Add artificial delay to make it feel like processing
+                        
+                        await websocket.send(json.dumps({
+                            "message": f"Calibrated pose: {pose_name}",
+                            "landmarks": current_landmarks,
+                            "calibration_success": True
+                        }))
+                    else:
+                        await websocket.send(json.dumps({
+                            "message": f"Failed to calibrate {pose_name}. No landmarks detected.",
+                            "landmarks": {},
+                            "calibration_success": False,
+                            "feedback": "Please ensure you are visible in the camera"
+                        }))
+                
+                elif action == 'startSession':
+                    # Start a pose session
+                    pose_name = data.get('pose')
+                    logger.info(f"Starting session for pose: {pose_name} for client {client_id}")
+                    
+                    # Update client session state
+                    client_sessions[client_id]["session_active"] = True
+                    client_sessions[client_id]["active_pose"] = pose_name
+                    
+                    # Send confirmation
+                    await websocket.send(json.dumps({
+                        "message": f"Session started for pose: {pose_name}",
+                        "landmarks": current_landmarks,
+                        "feedback": f"Begin {pose_name}. Adjust your position to match the reference."
+                    }))
+                
+                elif action == 'endSession':
+                    # End the current session
+                    logger.info(f"Session ended for client {client_id}")
+                    
+                    # Update client session state
+                    client_sessions[client_id]["session_active"] = False
+                    client_sessions[client_id]["active_pose"] = None
+                    
+                    # Send confirmation
+                    await websocket.send(json.dumps({
+                        "message": "Session ended",
+                        "landmarks": current_landmarks,
+                        "feedback": "Session complete. Great work!"
+                    }))
+                
+                elif action == 'changePose':
+                    # Change the current pose
+                    pose_name = data.get('pose')
+                    logger.info(f"Changed pose to: {pose_name} for client {client_id}")
+                    
+                    # Update client session state
+                    client_sessions[client_id]["active_pose"] = pose_name
+                    
+                    # Send confirmation
+                    await websocket.send(json.dumps({
+                        "message": f"Changed to pose: {pose_name}",
+                        "landmarks": current_landmarks,
+                        "feedback": f"Transitioning to {pose_name}. Find your balance and alignment."
+                    }))
+                
+            except json.JSONDecodeError:
+                logger.error(f"Received invalid JSON from client {client_id}")
+            except Exception as e:
+                logger.error(f"Error handling message from client {client_id}: {str(e)}")
+    
+    except websockets.exceptions.ConnectionClosed:
+        logger.info(f"Client {client_id} disconnected")
+    finally:
+        if websocket in clients:
+            clients.remove(websocket)
+        if client_id in client_sessions:
+            del client_sessions[client_id]
+        logger.info(f"Client {client_id} removed. Total clients: {len(clients)}")
 
-if __name__ == '__main__':
-    app.run(debug=True)
+# Function to send periodic updates to all clients
+async def send_updates():
+    while True:
+        if clients:
+            for client in list(clients):
+                try:
+                    client_id = id(client)
+                    session_state = client_sessions.get(client_id, {})
+                    
+                    # Create response with current landmarks
+                    response = {"landmarks": current_landmarks}
+                    
+                    # Add feedback if in active session
+                    if session_state.get("session_active", False):
+                        pose_name = session_state.get("active_pose")
+                        
+                        # Generate feedback by comparing current pose with calibrated pose
+                        if pose_name in calibration_data and current_landmarks:
+                            # Only send feedback occasionally to avoid spam
+                            current_time = time.time()
+                            if current_time - session_state.get("last_feedback_time", 0) > 2.0:  # Every 2 seconds
+                                ref_landmarks = calibration_data.get(pose_name)
+                                if ref_landmarks:
+                                    feedback = get_direction_feedback(current_landmarks, ref_landmarks)
+                                    response["feedback"] = feedback
+                                    client_sessions[client_id]["last_feedback_time"] = current_time
+                                    
+                                    # Calculate a simple accuracy percentage
+                                    if len(current_landmarks) > 0 and len(ref_landmarks) > 0:
+                                        # Simple calculation based on key points
+                                        key_points = [11, 12, 13, 14, 23, 24, 25, 26, 27, 28]  # Shoulders, elbows, hips, knees, ankles
+                                        errors = []
+                                        
+                                        for point in key_points:
+                                            if str(point) in current_landmarks and str(point) in ref_landmarks:
+                                                curr = current_landmarks[str(point)]
+                                                ref = ref_landmarks[str(point)]
+                                                
+                                                # Calculate distance between current and reference
+                                                dx = curr["x"] - ref["x"]
+                                                dy = curr["y"] - ref["y"]
+                                                distance = (dx**2 + dy**2)**0.5
+                                                errors.append(distance)
+                                                
+                                        if errors:
+                                            avg_error = sum(errors) / len(errors)
+                                            # Convert to accuracy (0-100%)
+                                            accuracy = max(0, min(100, 100 * (1 - avg_error / 0.2)))  # Normalize error
+                                            response["accuracy"] = int(accuracy)
+                    
+                    await client.send(json.dumps(response))
+                        
+                except websockets.exceptions.ConnectionClosed:
+                    if client in clients:
+                        clients.remove(client)
+                    client_id = id(client)
+                    if client_id in client_sessions:
+                        del client_sessions[client_id]
+                    logger.info(f"Client removed during update. Total clients: {len(clients)}")
+                except Exception as e:
+                    logger.error(f"Error sending update: {str(e)}")
+        
+        await asyncio.sleep(0.1)  # Send updates 10 times per second
+
+# Check if calibration directory exists and load reference poses
+def load_reference_images():
+    if os.path.exists('calibration'):
+        logger.info("Found calibration directory, checking for reference poses")
+        for filename in os.listdir('calibration'):
+            if filename.endswith(('.jpg', '.png', '.jpeg')):
+                logger.info(f"Found reference image: {filename}")
+
+# Start WebSocket server
+async def main():
+    global processing_active
+    
+    # Initialize video capture
+    if not initialize_video_capture():
+        logger.error("Failed to initialize video capture, exiting")
+        return
+    
+    # Check for reference images
+    load_reference_images()
+    
+    # Start video processing thread
+    video_thread = threading.Thread(target=process_video_frames)
+    video_thread.daemon = True
+    video_thread.start()
+    
+    try:
+        server = await websockets.serve(ws_handler, "127.0.0.1", 5000)
+        logger.info("WebSocket server started at ws://127.0.0.1:5000")
+        
+        # Create task for sending updates
+        update_task = asyncio.create_task(send_updates())
+        
+        # Keep the server running
+        await asyncio.Future()
+    except Exception as e:
+        logger.error(f"Server error: {str(e)}")
+    finally:
+        # Clean up resources
+        processing_active = False
+        if video_capture is not None:
+            video_capture.release()
+        logger.info("Resources cleaned up")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down WebSocket server")
+        # Ensure video processing is stopped
+        processing_active = False
+        if video_capture is not None:
+            video_capture.release()
